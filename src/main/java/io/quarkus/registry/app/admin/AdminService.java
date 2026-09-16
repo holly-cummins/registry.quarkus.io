@@ -24,6 +24,7 @@ import io.quarkus.registry.app.model.PlatformExtension;
 import io.quarkus.registry.app.model.PlatformRelease;
 import io.quarkus.registry.app.model.PlatformReleaseCategory;
 import io.quarkus.registry.app.model.PlatformStream;
+import io.quarkus.registry.app.util.Version;
 import io.quarkus.registry.catalog.ExtensionCatalog;
 import io.quarkus.registry.util.PlatformArtifacts;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -177,44 +178,81 @@ public class AdminService {
                     return newExtension;
                 });
 
-        // Name and description might have changed
-        extension.name = ext.getName();
-        extension.description = ext.getDescription();
-        extension.persist();
+        // Name and description might have changed, but only the most recent release influences the database
+        if (isMostRecentRelease(extension, version)) {
+            extension.name = ext.getName();
+            extension.description = ext.getDescription();
+            extension.persist();
+        }
 
-        return ExtensionRelease.findByGAV(groupId, artifactId, version)
+        final ExtensionRelease extensionRelease = ExtensionRelease.findByGAV(groupId, artifactId, version)
                 .orElseGet(() -> {
                     ExtensionRelease newExtensionRelease = new ExtensionRelease();
                     newExtensionRelease.version = version;
                     newExtensionRelease.extension = extension;
-                    String quarkusCore = (String) ext.getMetadata().get(MD_BUILT_WITH_QUARKUS_CORE);
-                    // Some extensions were published using the full GAV
-                    if (quarkusCore == null) {
-                        // Cannot determine Quarkus version
-                        quarkusCore = "0.0.0";
-                    } else if (quarkusCore.contains(":")) {
-                        try {
-                            quarkusCore = ArtifactCoords.fromString(quarkusCore).getVersion();
-                        } catch (IllegalArgumentException iae) {
-                            // ignore
-                        }
-                    }
-                    newExtensionRelease.quarkusCoreVersion = quarkusCore;
-                    // Many-to-many
-                    if (platformRelease != null) {
-                        PlatformExtension platformExtension = new PlatformExtension();
-                        platformExtension.extensionRelease = newExtensionRelease;
-                        platformExtension.platformRelease = platformRelease;
-                        platformExtension.metadata = ext.getMetadata();
-
-                        platformRelease.extensions.add(platformExtension);
-                        newExtensionRelease.platforms.add(platformExtension);
-                    } else {
-                        newExtensionRelease.metadata = ext.getMetadata();
-                    }
+                    newExtensionRelease.quarkusCoreVersion = quarkusCoreVersionOf(ext);
                     newExtensionRelease.persist();
                     return newExtensionRelease;
                 });
+
+        if (platformRelease == null) {
+            extensionRelease.metadata = ext.getMetadata();
+            extensionRelease.persist();
+        } else {
+            // Many-to-many. An extension version is sometimes carried over unchanged into several platform releases, so
+            // the link has to be recorded for each of them, and the metadata refreshed: the catalog being imported is
+            // the most recent word on the extension, and it may well correct what an earlier release said about it
+            // (a category, for example).
+            PlatformExtension platformExtension = PlatformExtension.findByNaturalKey(platformRelease, extensionRelease)
+                    .orElseGet(() -> {
+                        PlatformExtension newPlatformExtension = new PlatformExtension();
+                        newPlatformExtension.extensionRelease = extensionRelease;
+                        newPlatformExtension.platformRelease = platformRelease;
+
+                        platformRelease.extensions.add(newPlatformExtension);
+                        extensionRelease.platforms.add(newPlatformExtension);
+                        return newPlatformExtension;
+                    });
+            platformExtension.metadata = ext.getMetadata();
+            platformExtension.persist();
+        }
+        return extensionRelease;
+    }
+
+    /**
+     * Whether no release newer than {@code version} is already recorded for the extension.
+     * <p>
+     * Catalogs do not reach the registry in release order: an LTS respin, a late member BOM or a re-import of the
+     * archive all arrive after releases they are older than. Those catalogs still carry a name and a description for
+     * every extension they ship, and taking them at face value silently reverts the extension to how it was described
+     * back then.
+     * <p>
+     * A release already recorded under the same version does not count as newer: that is how an extension carried
+     * over unchanged into a later platform release shows up, and it describes the same artifact.
+     */
+    private static boolean isMostRecentRelease(Extension extension, String version) {
+        return ExtensionRelease.count("extension = ?1 and versionSortable > ?2",
+                extension, Version.toSortable(version)) == 0;
+    }
+
+    /**
+     * Returns the Quarkus core version the extension was built with, or {@code 0.0.0} if the catalog does not say.
+     */
+    private static String quarkusCoreVersionOf(io.quarkus.registry.catalog.Extension ext) {
+        String quarkusCore = (String) ext.getMetadata().get(MD_BUILT_WITH_QUARKUS_CORE);
+        if (quarkusCore == null) {
+            // Cannot determine Quarkus version
+            return "0.0.0";
+        }
+        // Some extensions were published using the full GAV
+        if (quarkusCore.contains(":")) {
+            try {
+                return ArtifactCoords.fromString(quarkusCore).getVersion();
+            } catch (IllegalArgumentException iae) {
+                // ignore
+            }
+        }
+        return quarkusCore;
     }
 
     @Transactional

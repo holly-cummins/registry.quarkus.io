@@ -38,6 +38,9 @@ import jakarta.transaction.Transactional;
 @DisplayNameGeneration(DisplayNameGenerator.ReplaceUnderscores.class)
 class AdminApiTest extends BaseTest {
 
+    /** Picks the fixture's {@code foo.bar:foo-extension} out of a client extension catalog. */
+    private static final String FOO_EXTENSION = "extensions.find { it.artifact.startsWith('foo.bar:foo-extension') }";
+
     @BeforeEach
     @Transactional
     void setUp() {
@@ -177,6 +180,49 @@ class AdminApiTest extends BaseTest {
                 .body("extensions.name", hasItem("Another Name"),
                         "extensions.description", hasItem("Another Description"));
 
+    }
+
+    /**
+     * Catalogs do not reach the registry in release order: an LTS respin, a late member BOM or a re-import of the
+     * archive all arrive after releases they are older than. Such a catalog must not revert the extension to how it
+     * was described back then.
+     *
+     * @see <a href="https://github.com/quarkusio/registry.quarkus.io/issues/205">#205</a>
+     */
+    @Test
+    void extension_description_is_not_overwritten_by_an_older_release() throws IOException {
+        publishFooExtension("1.1.0", "Newer Name", "Newer Description");
+        publishFooExtension("1.0.1", "Older Name", "Older Description");
+
+        given()
+                .get("/client/extensions/all")
+                .then()
+                .statusCode(HttpURLConnection.HTTP_OK)
+                .log().ifValidationFails()
+                .body(FOO_EXTENSION + ".name", is("Newer Name"),
+                        FOO_EXTENSION + ".description", is("Newer Description"));
+    }
+
+    private static void publishFooExtension(String version, String name, String description) throws IOException {
+        io.quarkus.registry.catalog.Extension extension = io.quarkus.registry.catalog.Extension.builder()
+                .setGroupId("foo.bar")
+                .setArtifactId("foo-extension")
+                .setVersion(version)
+                .setName(name)
+                .setDescription(description)
+                .setArtifact(ArtifactCoords.jar("foo.bar", "foo-extension", version))
+                .build();
+        StringWriter sw = new StringWriter();
+        CatalogMapperHelper.serialize(extension, sw);
+
+        given()
+                .body(sw.toString())
+                .header("Token", "test")
+                .contentType(ContentType.JSON)
+                .post("/admin/v1/extension")
+                .then()
+                .log().ifValidationFails()
+                .statusCode(HttpURLConnection.HTTP_ACCEPTED);
     }
 
     @Test
